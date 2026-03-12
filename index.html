@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>ひとりじゃんけんマスター 60</title>
+    
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0; background-color: #000;
+            display: flex; justify-content: center; align-items: center;
+            height: 100vh; width: 100vw; overflow: hidden;
+            font-family: 'Arial Black', 'Hiragino Kaku Gothic Pro', 'Meiryo', sans-serif;
+        }
+        .container { position: relative; width: 100%; height: 100%; }
+        video { display: none; }
+        canvas { width: 100vw; height: 100vh; object-fit: cover; transform: scaleX(-1); }
+
+        .ui-header {
+            position: absolute; top: 20px; left: 0; width: 100%;
+            padding: 0 50px; display: flex; justify-content: space-between; z-index: 50;
+        }
+        .info-box {
+            background: rgba(0,0,0,0.8); padding: 15px 35px; border-radius: 15px;
+            font-size: 38px; border: 4px solid; font-weight: 900; min-width: 240px; text-align: center;
+        }
+        #score-display { color: #00ffcc; border-color: #00ffcc; }
+        #timer-display { color: #ff3366; border-color: #ff3366; }
+
+        #command-container {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            width: 100%; text-align: center; z-index: 20; pointer-events: none;
+        }
+        #command-text {
+            font-size: min(20vh, 14vw); font-weight: 900; color: #00ff00;
+            text-shadow: 4px 4px 0px #000, -4px -4px 0px #000, 0 0 50px rgba(0,0,0,1);
+        }
+
+        .overlay {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            display: flex; flex-direction: column; justify-content: center; align-items: center;
+            z-index: 100; color: white; background: rgba(0,0,0,0.9);
+        }
+        .btn-start {
+            padding: 30px 70px; font-size: 36px; background: #28a745; color: white;
+            border: none; border-radius: 70px; cursor: pointer; font-weight: bold;
+        }
+        .guide-box {
+            margin-top: 20px; text-align: center; font-size: 24px; line-height: 1.8;
+            background: rgba(0,0,0,0.85); padding: 30px 50px; border-radius: 25px;
+        }
+        .highlight { color: #00ffcc; font-weight: bold; }
+    </style>
+</head>
+<body>
+
+    <div class="container">
+        <video id="input_video" playsinline></video>
+        <canvas id="output_canvas"></canvas>
+
+        <div class="ui-header">
+            <div id="score-display" class="info-box">SCORE: <span id="val-score">0</span></div>
+            <div id="timer-display" class="info-box">TIME: <span id="val-timer">60</span></div>
+        </div>
+
+        <div id="command-container">
+            <div id="command-text"></div>
+        </div>
+
+        <div id="start-screen" class="overlay">
+            <h1 style="font-size: 60px; margin-bottom: 20px;">ひとりじゃんけんマスター 60</h1>
+            <button class="btn-start" onclick="initApp()">カメラを起動</button>
+            <div class="guide-box">
+                指示に合わせて左右の手を出そう！<br>
+                <span class="highlight">「片手を高くあげて」→「おろす」</span> でスタート！
+            </div>
+        </div>
+
+        <div id="result-screen" class="overlay" style="display: none;">
+            <h1 style="font-size: 110px; color: #ffcc00; margin-bottom: 10px;">FINISH!</h1>
+            <div style="font-size: 90px; margin-bottom: 30px;">SCORE: <span id="final-score" style="color:#00ffcc;">0</span></div>
+            <div class="guide-box">片手をあげて、おろすとリスタート</div>
+        </div>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('input_video');
+        const canvasElement = document.getElementById('output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+        const cmdText = document.getElementById('command-text');
+
+        // 出題パターン生成
+        const sides = ["左", "右"];
+        const handShapes = ["グー", "チョキ", "パー"];
+        const conditions = ["勝って", "負けて"];
+        let commandList = [];
+        sides.forEach(s => handShapes.forEach(h => conditions.forEach(c => {
+            commandList.push({ side: s, shape: h, cond: c });
+        })));
+
+        let currentTarget = null;
+        let score = 0;
+        let timeLeft = 60;
+        let gameActive = false;
+        let isProcessingSuccess = false;
+        let waitingForStartDown = false;
+        let startLockedAfterAbort = false; 
+        let restartTimeLock = false; 
+        let timerInterval = null;
+        let appInitialized = false;
+
+        let handsUpStartTime = null;
+        const EXIT_HOLD_TIME = 3000;
+
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const synth = window.speechSynthesis;
+
+        function playSound(freq, duration) {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.frequency.value = freq;
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+            osc.start();
+            gain.gain.exponentialRampToValueAtTime(0.00001, audioCtx.currentTime + duration);
+            osc.stop(audioCtx.currentTime + duration);
+        }
+
+        function speak(text) {
+            synth.cancel();
+            const uttr = new SpeechSynthesisUtterance(text);
+            uttr.lang = 'ja-JP';
+            uttr.rate = 2.0;
+            synth.speak(uttr);
+        }
+
+        function startGame() {
+            gameActive = true;
+            isProcessingSuccess = false;
+            restartTimeLock = false;
+            score = 0;
+            timeLeft = 60;
+            document.getElementById('val-score').innerText = score;
+            document.getElementById('start-screen').style.display = 'none';
+            document.getElementById('result-screen').style.display = 'none';
+            playSound(880, 0.5);
+            nextCommand();
+
+            timerInterval = setInterval(() => {
+                timeLeft--;
+                document.getElementById('val-timer').innerText = timeLeft;
+                if (timeLeft <= 0) endGame(false);
+            }, 1000);
+        }
+
+        function nextCommand() {
+            currentTarget = commandList[Math.floor(Math.random() * commandList.length)];
+            const text = `${currentTarget.side}が ${currentTarget.shape} で ${currentTarget.cond}`;
+            cmdText.innerText = text;
+            cmdText.style.color = "#00ff00";
+            speak(text);
+        }
+
+        function endGame(isAborted = false) {
+            gameActive = false;
+            clearInterval(timerInterval);
+            document.getElementById('result-screen').style.display = 'flex';
+            document.getElementById('final-score').innerText = score;
+            cmdText.innerText = "";
+            restartTimeLock = true;
+            setTimeout(() => { restartTimeLock = false; }, 3000);
+            if (isAborted) { speak("中断しました"); startLockedAfterAbort = true; } 
+            else { speak("終了です"); }
+        }
+
+        // 手の形を判定する関数
+        function getHandGesture(landmarks) {
+            // 指の先端と第2関節の比較で曲げ伸ばしを判定
+            const fingerIndices = [8, 12, 16, 20]; // 人差し指, 中指, 薬指, 小指の先
+            const extended = fingerIndices.map(idx => landmarks[idx].y < landmarks[idx - 2].y);
+            
+            const extendedCount = extended.filter(v => v).length;
+
+            if (extendedCount <= 1) return "グー";
+            if (extendedCount >= 4) return "パー";
+            if (extended[0] && extended[1] && !extended[2] && !extended[3]) return "チョキ";
+            return "不明";
+        }
+
+        function onResults(results) {
+            canvasElement.width = results.image.width;
+            canvasElement.height = results.image.height;
+            canvasCtx.save();
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            let detectedHands = { "Left": null, "Right": null };
+            let anyHandHigh = false;
+
+            if (results.multiHandLandmarks && results.multiHandedness) {
+                for (let i = 0; i < results.multiHandLandmarks.length; i++) {
+                    const landmarks = results.multiHandLandmarks[i];
+                    const label = results.multiHandedness[i].label; // "Left" or "Right" (MediaPipeの仕様上、鏡像だと逆になる場合があるが、ここではそのまま扱う)
+                    
+                    drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, {color: '#00FF00', lineWidth: 5});
+                    drawLandmarks(canvasCtx, landmarks, {color: '#FF0000', lineWidth: 2});
+
+                    detectedHands[label] = getHandGesture(landmarks);
+                    if (landmarks[0].y < 0.3) anyHandHigh = true; // 手首が画面上部にあるか
+                }
+            }
+
+            // --- スタート・中断制御 ---
+            if (gameActive) {
+                if (anyHandHigh) {
+                    if (handsUpStartTime === null) handsUpStartTime = Date.now();
+                    if (Date.now() - handsUpStartTime >= EXIT_HOLD_TIME) {
+                        endGame(true);
+                        handsUpStartTime = null;
+                    }
+                } else { handsUpStartTime = null; }
+            } else {
+                if (anyHandHigh) {
+                    if (!startLockedAfterAbort && !restartTimeLock) waitingForStartDown = true;
+                } else {
+                    if (waitingForStartDown && !startLockedAfterAbort && !restartTimeLock) {
+                        startGame();
+                    }
+                    startLockedAfterAbort = false;
+                    waitingForStartDown = false;
+                }
+            }
+
+            // --- 正解判定 ---
+            if (gameActive && !isProcessingSuccess && currentTarget) {
+                const leftHand = detectedHands["Right"]; // MediaPipeのRightは画面向かって左
+                const rightHand = detectedHands["Left"];
+
+                if (leftHand && rightHand && leftHand !== "不明" && rightHand !== "不明") {
+                    let isCorrect = false;
+                    const { side, shape, cond } = currentTarget;
+
+                    // 指定された手の形が合っているか
+                    const targetHandShape = (side === "左") ? leftHand : rightHand;
+                    const otherHandShape = (side === "左") ? rightHand : leftHand;
+
+                    if (targetHandShape === shape) {
+                        // 条件（勝つ・負ける）を満たしているか
+                        if (cond === "勝って") {
+                            if (shape === "グー" && otherHandShape === "チョキ") isCorrect = true;
+                            if (shape === "チョキ" && otherHandShape === "パー") isCorrect = true;
+                            if (shape === "パー" && otherHandShape === "グー") isCorrect = true;
+                        } else { // 負けて
+                            if (shape === "グー" && otherHandShape === "パー") isCorrect = true;
+                            if (shape === "チョキ" && otherHandShape === "グー") isCorrect = true;
+                            if (shape === "パー" && otherHandShape === "チョキ") isCorrect = true;
+                        }
+                    }
+
+                    if (isCorrect) {
+                        isProcessingSuccess = true;
+                        score++;
+                        document.getElementById('val-score').innerText = score;
+                        playSound(1200, 0.2);
+                        cmdText.innerText = "正解！";
+                        cmdText.style.color = "#ff3366";
+                        setTimeout(() => {
+                            isProcessingSuccess = false;
+                            nextCommand();
+                        }, 800);
+                    }
+                }
+            }
+            canvasCtx.restore();
+        }
+
+        const hands = new Hands({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+        });
+        hands.setOptions({
+            maxNumHands: 2,
+            modelComplexity: 1,
+            minDetectionConfidence: 0.7,
+            minTrackingConfidence: 0.7
+        });
+        hands.onResults(onResults);
+
+        const camera = new Camera(videoElement, {
+            onFrame: async () => { await hands.send({image: videoElement}); },
+            width: 1280, height: 720
+        });
+
+        function initApp() {
+            if (appInitialized) return;
+            audioCtx.resume();
+            appInitialized = true;
+            document.querySelector('.btn-start').style.display = 'none';
+            document.getElementById('start-screen').style.background = 'rgba(0,0,0,0.2)';
+            camera.start();
+        }
+    </script>
+</body>
+</html>
